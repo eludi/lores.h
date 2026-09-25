@@ -78,11 +78,17 @@ extern "C" {
 
 /// portable console input output similar to conio.h
 
+// Call shutdownscr() (or register it with atexit) before normal process exit.
 void initscr();
+void shutdownscr();
 void scrsize(int* width, int* height);
 void echoon();
 void echooff();
 int kbhit();
+// Linux escape-sequence inter-byte timeout; override before including this header.
+#ifndef LORES_KEY_TIMEOUT_MS
+#define LORES_KEY_TIMEOUT_MS 50
+#endif
 int getkey();
 
 static inline void clrscr() { printf("\033[H\033[J"); }
@@ -99,6 +105,7 @@ static inline void colorReset() { printf("\033[0m"); }
 //------------------------------------------------------------------
 
 void delay(uint32_t duration_ms);
+// Define LORES_NO_AUDIO to make sound() a no-op without audio dependencies.
 void sound(uint32_t frequency, uint32_t duration_ms);
 uint64_t timestamp();
 // Uniform integer in [0, upperBound); an empty range returns zero.
@@ -153,30 +160,58 @@ uint8_t* BlockBufDecode(const char data[], uint16_t w, uint16_t h, const char* c
 #ifdef LORES_H_IMPLEMENTATION
 #  include <time.h>
 
+#ifndef LORES_NO_AUDIO
 typedef struct { uint32_t frequency, duration_ms; } LoresSoundArgs;
+#endif
 
 #if defined __WIN32__ || defined WIN32
 #  define WIN32_LEAN_AND_MEAN
 #  include <windows.h>
 #  include <conio.h>
-#  include <process.h>
+#  ifndef LORES_NO_AUDIO
+#    include <process.h>
+#  endif
 
 #ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
 #  define ENABLE_VIRTUAL_TERMINAL_PROCESSING  0x0004
 #endif
 
+static int lores_screen_active;
+static DWORD lores_input_mode, lores_output_mode;
+static int lores_have_input_mode, lores_have_output_mode;
+static UINT lores_output_codepage;
+static CONSOLE_CURSOR_INFO lores_cursor_info;
+static CONSOLE_SCREEN_BUFFER_INFO lores_screen_info;
+static int lores_have_cursor_info, lores_have_screen_info;
+
 void initscr() {
+	if (lores_screen_active) return;
 	srand(time(NULL));
-	DWORD outMode = 0;
+	HANDLE sin = GetStdHandle(STD_INPUT_HANDLE);
 	HANDLE sout = GetStdHandle(STD_OUTPUT_HANDLE);
-	if(sout == INVALID_HANDLE_VALUE || !GetConsoleMode(sout, &outMode))
-		exit(GetLastError());
-	
-	// enable ANSI escape codes
-	outMode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
-	if(!SetConsoleMode(sout, outMode))
-		exit(GetLastError());
-	SetConsoleOutputCP(CP_UTF8);
+	lores_have_input_mode = GetConsoleMode(sin, &lores_input_mode);
+	lores_have_output_mode = GetConsoleMode(sout, &lores_output_mode);
+	lores_have_cursor_info = GetConsoleCursorInfo(sout, &lores_cursor_info);
+	lores_have_screen_info = GetConsoleScreenBufferInfo(sout, &lores_screen_info);
+	lores_output_codepage = GetConsoleOutputCP();
+	lores_screen_active = 1;
+	if (lores_have_output_mode) {
+		SetConsoleMode(sout, lores_output_mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+		SetConsoleOutputCP(CP_UTF8);
+	}
+}
+
+void shutdownscr() {
+	if (!lores_screen_active) return;
+	fflush(stdout);
+	HANDLE sin = GetStdHandle(STD_INPUT_HANDLE);
+	HANDLE sout = GetStdHandle(STD_OUTPUT_HANDLE);
+	if (lores_have_screen_info) SetConsoleTextAttribute(sout, lores_screen_info.wAttributes);
+	if (lores_have_cursor_info) SetConsoleCursorInfo(sout, &lores_cursor_info);
+	if (lores_have_input_mode) SetConsoleMode(sin, lores_input_mode);
+	if (lores_have_output_mode) SetConsoleMode(sout, lores_output_mode);
+	if (lores_output_codepage) SetConsoleOutputCP(lores_output_codepage);
+	lores_screen_active = 0;
 }
 
 void echooff() {
@@ -201,7 +236,7 @@ void echoon() {
 
 int getkey() {
 	int c = getch();
-	if((c==0xE0 || c==0) && kbhit()) // special key
+	if(c==0xE0 || c==0) // getch supplies the second special-key byte
 		c = -getch();
 	return c;
 }
@@ -210,6 +245,7 @@ void delay(uint32_t duration_ms) {
 	Sleep(duration_ms);
 }
 
+#ifndef LORES_NO_AUDIO
 static void sound_thread(void *args) {
 	const LoresSoundArgs params_arg = *(LoresSoundArgs*)args;
 	free(args);
@@ -228,11 +264,15 @@ void sound(uint32_t frequency, uint32_t duration_ms) {
 		free(args);
 }
 
+#endif // !LORES_NO_AUDIO
+
 #else
 #  include <unistd.h>
 #  include <sys/ioctl.h>
 #  include <termios.h>
-#  include <fcntl.h>
+#  include <poll.h>
+#  include <errno.h>
+#  ifndef LORES_NO_AUDIO
 #  ifdef __cplusplus
 extern "C" {
 #  endif
@@ -242,118 +282,162 @@ extern "C" {
 #  endif
 #  include <math.h>
 #  include <pthread.h>
+#  endif // !LORES_NO_AUDIO
+
+static int lores_screen_active, lores_have_termios, lores_terminal_output;
+static struct termios lores_original_termios;
+static int lores_pending_key = -1;
 
 void initscr() {
+	if (lores_screen_active) return;
 	srand(time(NULL));
+	lores_have_termios = tcgetattr(STDIN_FILENO, &lores_original_termios) == 0;
+	lores_terminal_output = isatty(STDOUT_FILENO);
+	lores_screen_active = 1;
+	if (lores_terminal_output) {
+		// Save cursor visibility where DEC private-mode save/restore is supported.
+		fputs("\033[?25s", stdout);
+		fflush(stdout);
+	}
+}
+
+void shutdownscr() {
+	if (!lores_screen_active) return;
+	if (lores_have_termios)
+		tcsetattr(STDIN_FILENO, TCSANOW, &lores_original_termios);
+	if (lores_terminal_output) {
+		// Show the cursor as a fallback, then restore its saved visibility.
+		fputs("\033[0m\033[?25h\033[?25r", stdout);
+		fflush(stdout);
+	}
+	lores_pending_key = -1;
+	lores_screen_active = 0;
 }
 
 void echooff() {
 	struct termios t;
-	tcgetattr(STDIN_FILENO, &t);
+	if (tcgetattr(STDIN_FILENO, &t) != 0) return;
 	t.c_lflag &= ~(ICANON | ECHO);
+	t.c_cc[VMIN] = 1;
+	t.c_cc[VTIME] = 0;
 	tcsetattr(STDIN_FILENO, TCSANOW, &t);
 }
 
 void echoon() {
 	struct termios t;
-	tcgetattr(STDIN_FILENO, &t);
-	t.c_lflag |= (ICANON | ECHO);
+	if (tcgetattr(STDIN_FILENO, &t) != 0) return;
+	t.c_lflag |= ICANON | ECHO;
 	tcsetattr(STDIN_FILENO, TCSANOW, &t);
 }
 
-int kbhit() {
-	struct termios oldt, newt;
-	tcgetattr(STDIN_FILENO, &oldt);
-	newt = oldt;
-	newt.c_lflag &= ~(ICANON | ECHO);
-	tcsetattr(STDIN_FILENO, TCSANOW, &newt);
-
-	int oldf = fcntl(STDIN_FILENO, F_GETFL, 0);
-	fcntl(STDIN_FILENO, F_SETFL, oldf | O_NONBLOCK);
-	int ch = getchar();
-	fcntl(STDIN_FILENO, F_SETFL, oldf);
-	tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
-	
-	if(ch != EOF) {
-		ungetc(ch, stdin);
-		return 1;
+// Keyboard input uses the descriptor directly; do not mix it with stdio reads.
+static int lores_read_key_byte(int timeout_ms) {
+	if (lores_pending_key >= 0) {
+		int ch = lores_pending_key;
+		lores_pending_key = -1;
+		return ch;
 	}
-	return 0;
+	struct pollfd fd = { STDIN_FILENO, POLLIN, 0 };
+	int ready;
+	do { ready = poll(&fd, 1, timeout_ms); } while (ready < 0 && errno == EINTR);
+	if (ready <= 0) return -1;
+	unsigned char ch;
+	ssize_t count;
+	do { count = read(STDIN_FILENO, &ch, 1); } while (count < 0 && errno == EINTR);
+	return count == 1 ? ch : -1;
+}
+
+static int lores_key_mode(struct termios *saved) {
+	if (tcgetattr(STDIN_FILENO, saved) != 0) return 0;
+	struct termios raw = *saved;
+	raw.c_lflag &= ~(ICANON | ECHO);
+	raw.c_cc[VMIN] = 1;
+	raw.c_cc[VTIME] = 0;
+	return tcsetattr(STDIN_FILENO, TCSANOW, &raw) == 0;
+}
+
+int kbhit() {
+	if (lores_pending_key >= 0) return 1;
+	struct termios saved;
+	int restore = lores_key_mode(&saved);
+	lores_pending_key = lores_read_key_byte(0);
+	if (restore) tcsetattr(STDIN_FILENO, TCSANOW, &saved);
+	return lores_pending_key >= 0;
+}
+
+static int lores_escape_key(void) {
+	int ch = lores_read_key_byte(LORES_KEY_TIMEOUT_MS);
+	if (ch < 0) return KEY_ESCAPE;
+	if (ch != '[' && ch != 'O') {
+		lores_pending_key = ch;
+		return KEY_ESCAPE;
+	}
+	const int csi = ch == '[';
+	int number = 0, first_parameter = 1;
+	for (int n = 0; n < 32; ++n) {
+		ch = lores_read_key_byte(LORES_KEY_TIMEOUT_MS);
+		if (ch < 0) return KEY_UNKNOWN;
+		if (csi && n == 0 && ch == '[') { // Linux console F1-F5
+			ch = lores_read_key_byte(LORES_KEY_TIMEOUT_MS);
+			return ch >= 'A' && ch <= 'E' ? KEY_F1 - (ch - 'A') : KEY_UNKNOWN;
+		}
+		if (ch >= '0' && ch <= '9') {
+			if (first_parameter) number = number < 1000 ? number * 10 + ch - '0' : 1000;
+			continue;
+		}
+		if (ch == ';') { first_parameter = 0; continue; }
+		if (ch >= 0x20 && ch <= 0x3f) continue;
+		switch (ch) {
+		case 'A': return KEY_UP;
+		case 'B': return KEY_DOWN;
+		case 'C': return KEY_RIGHT;
+		case 'D': return KEY_LEFT;
+		case 'H': return KEY_HOME;
+		case 'F': return KEY_END;
+		case 'P': return KEY_F1;
+		case 'Q': return KEY_F2;
+		case 'R': return KEY_F3;
+		case 'S': return KEY_F4;
+		case '~':
+			switch (number) {
+			case 1: case 7: return KEY_HOME;
+			case 2: return KEY_INSERT;
+			case 3: return KEY_DELETE;
+			case 4: case 8: return KEY_END;
+			case 5: return KEY_PAGEUP;
+			case 6: return KEY_PAGEDOWN;
+			case 11: return KEY_F1;
+			case 12: return KEY_F2;
+			case 13: return KEY_F3;
+			case 14: return KEY_F4;
+			case 15: return KEY_F5;
+			case 17: return KEY_F6;
+			case 18: return KEY_F7;
+			case 19: return KEY_F8;
+			case 20: return KEY_F9;
+			case 21: return KEY_F10;
+			case 23: return KEY_F11;
+			case 24: return KEY_F12;
+			}
+		}
+		return KEY_UNKNOWN;
+	}
+	return KEY_UNKNOWN;
 }
 
 int getkey() {
-	struct termios oldt, newt;
-	tcgetattr( STDIN_FILENO, &oldt );
-	newt = oldt;
-	newt.c_lflag &= ~(ICANON|ECHO);
-	tcsetattr( STDIN_FILENO, TCSANOW, &newt );
-	int ch = getchar();
-
-	if(ch==10)
-		ch=13;
-	else if(ch==127)
-		ch=8;
-	else if(ch==27 && kbhit()) {
-		getchar(); // swallow [
-		if(!kbhit())
-			ch = KEY_UNKNOWN;
-		else {
-			ch = getchar();
-			switch(ch) {
-			case 49:
-				switch(getchar()) {
-				case 53: ch = KEY_F5; break;
-				case 55: ch = KEY_F6; break;
-				case 56: ch = KEY_F7; break;
-				case 57: ch = KEY_F8; break;	
-				default: ch = KEY_UNKNOWN;					
-				}
-				getchar(); // swallow 126
-				break;
-			case 50:
-				ch = getchar();
-				switch(ch) {
-				case 48: ch = KEY_F9; break;
-				case 49: ch = KEY_F10; break;
-				case 51: ch = KEY_F11; break;
-				case 52: ch = KEY_F12; break;
-				case 126: ch = KEY_INSERT; break;
-				default: ch = KEY_UNKNOWN;
-				}
-				if(ch!=KEY_INSERT) getchar(); // swallow 126
-				break;
-			case 51: ch = KEY_DELETE; getchar(); break;
-			case 53: ch = KEY_PAGEUP; getchar(); break;
-			case 54: ch = KEY_PAGEDOWN; getchar(); break;
-			case 65: ch = KEY_UP; break;
-			case 66: ch = KEY_DOWN; break;
-			case 67: ch = KEY_RIGHT; break;
-			case 68: ch = KEY_LEFT; break;
-			case 70: ch = KEY_END; break;
-			case 72: ch = KEY_HOME; break;
-			case 80: ch = KEY_F1; break;
-			case 81: ch = KEY_F2; break;
-			case 82: ch = KEY_F3; break;
-			case 83: ch = KEY_F4; break;
-			case 91:
-				ch = getchar();
-				switch(ch) {
-				case 65: ch = KEY_F1; break;
-				case 66: ch = KEY_F2; break;
-				case 67: ch = KEY_F3; break;
-				case 68: ch = KEY_F4; break;
-				case 69: ch = KEY_F5; break;
-				default: ch = KEY_UNKNOWN;
-				}
-				if(kbhit()) getchar(); // swallow 126
-				break;
-			default: ch = KEY_UNKNOWN;
-			}
-		}
+	struct termios saved;
+	int restore = lores_key_mode(&saved);
+	int ch = lores_read_key_byte(-1);
+	if (ch == '\n') ch = KEY_ENTER;
+	else if (ch == 127) ch = KEY_BACKSPACE;
+	else if (ch == KEY_ESCAPE) ch = lores_escape_key();
+	else if (ch == 195) { // Preserve the existing two-byte Latin-1 key mapping.
+		int next = lores_read_key_byte(LORES_KEY_TIMEOUT_MS);
+		if (next >= 128 && next <= 191) ch = next;
+		else if (next >= 0) lores_pending_key = next;
 	}
-	else if(ch==195 && kbhit())
-		ch = getchar();
-	tcsetattr( STDIN_FILENO, TCSANOW, &oldt );
+	if (restore) tcsetattr(STDIN_FILENO, TCSANOW, &saved);
 	return ch;
 }
 
@@ -362,6 +446,7 @@ void delay(uint32_t duration_ms) {
 }
 
 
+#ifndef LORES_NO_AUDIO
 static pthread_mutex_t sound_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int sound_unavailable = 0;
 
@@ -458,6 +543,14 @@ void sound(uint32_t frequency, uint32_t duration_ms) {
 		pthread_detach(thread);
 	else
 		free(args);
+}
+#endif // !LORES_NO_AUDIO
+#endif // platform
+
+#ifdef LORES_NO_AUDIO
+void sound(uint32_t frequency, uint32_t duration_ms) {
+	(void)frequency;
+	(void)duration_ms;
 }
 #endif
 
