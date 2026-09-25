@@ -89,6 +89,7 @@ int kbhit();
 #ifndef LORES_KEY_TIMEOUT_MS
 #define LORES_KEY_TIMEOUT_MS 50
 #endif
+// On Linux, do not mix these keyboard functions with stdio reads from stdin.
 int getkey();
 
 static inline void clrscr() { printf("\033[H\033[J"); }
